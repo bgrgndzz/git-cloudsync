@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 usage() {
   cat <<'EOF'
 cloudsync — keep the current branch caught up with its remote
 
-  cloudsync sync                 fetch and fast-forward once
-  cloudsync watch [--interval N] fetch and fast-forward continuously
+  cloudsync sync                 fetch and sync once
+  cloudsync watch [--interval N] fetch and sync continuously
   cloudsync status               compare the current branch with its upstream
   cloudsync version              print version
 
-Cloudsync only moves remote → local. It never pushes, creates merge commits,
-resets, stashes, or overwrites local work. Dirty, ahead, and diverged branches
-are left untouched.
+Cloudsync only moves remote → local. It follows rebases and force-pushes, but
+never pushes or overwrites dirty files. Replaced local commits are kept under
+refs/cloudsync/recovery/<branch>.
 EOF
 }
 
@@ -63,7 +63,7 @@ is_clean() {
 }
 
 sync_once() {
-  local state count old_short new_short
+  local state count old_sha old_short new_short recovery_ref
 
   if ! fetch_upstream; then
     note "could not fetch '$REMOTE'; retry later"
@@ -71,24 +71,16 @@ sync_once() {
   fi
   state=$(relation)
 
+  if [ "$state" != "current" ] && ! is_clean; then
+    note "paused — local files are dirty; commit or discard them before syncing"
+    return 2
+  fi
+
   case "$state" in
     current)
       return 0
       ;;
-    ahead)
-      note "paused — '$BRANCH' has local commits not on '$REMOTE/${MERGE_REF#refs/heads/}'"
-      return 2
-      ;;
-    diverged)
-      note "paused — local and remote histories diverged; resolve them manually"
-      return 2
-      ;;
     behind)
-      if ! is_clean; then
-        note "paused — local files are dirty; commit or discard them before syncing"
-        return 2
-      fi
-
       count=$(git -C "$ROOT" rev-list --count HEAD.."$UPSTREAM_REF")
       old_short=$(git -C "$ROOT" rev-parse --short HEAD)
       if ! git -C "$ROOT" merge --ff-only --quiet "$UPSTREAM_REF"; then
@@ -97,6 +89,23 @@ sync_once() {
       fi
       new_short=$(git -C "$ROOT" rev-parse --short HEAD)
       note "updated '$BRANCH' $old_short → $new_short ($count commit$( [ "$count" = 1 ] || printf 's' ))"
+      ;;
+    ahead|diverged)
+      old_sha=$(git -C "$ROOT" rev-parse HEAD)
+      old_short=$(git -C "$ROOT" rev-parse --short HEAD)
+      recovery_ref="refs/cloudsync/recovery/$BRANCH"
+      if ! git -C "$ROOT" update-ref --create-reflog \
+        -m "cloudsync: before following rewritten upstream" \
+        "$recovery_ref" "$old_sha"; then
+        note "could not save recovery ref; local work was left untouched"
+        return 3
+      fi
+      if ! git -C "$ROOT" reset --hard --quiet "$UPSTREAM_REF"; then
+        note "update failed; previous HEAD is saved at $recovery_ref"
+        return 3
+      fi
+      new_short=$(git -C "$ROOT" rev-parse --short HEAD)
+      note "followed rewritten upstream $old_short → $new_short (recovery: $recovery_ref)"
       ;;
   esac
 }

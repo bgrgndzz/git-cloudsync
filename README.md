@@ -4,7 +4,7 @@
 
 Keep a local git worktree caught up with work pushed by cloud coding agents.
 
-Cloudsync watches the checked-out branch's upstream and fast-forwards the local worktree whenever new commits arrive. It is strictly one-way: **remote → local**.
+Cloudsync watches the checked-out branch's upstream and makes the local worktree match whenever new commits arrive. It is strictly one-way: **remote → local**.
 
 ## Install
 
@@ -25,12 +25,12 @@ cd ~/worktrees/my-feature
 cloudsync watch
 ```
 
-That is the whole loop. Leave it running while you test. Each new remote commit fast-forwards the checked-out branch and updates the files your local dev server sees.
+That is the whole loop. Leave it running while you test. New commits, rebases, and force-pushes update the checked-out branch and the files your local dev server sees.
 
 Other commands:
 
 ```sh
-cloudsync sync                 # fetch and fast-forward once
+cloudsync sync                 # fetch and sync once
 cloudsync watch --interval 10  # poll every 10 seconds (default: 5)
 cloudsync status               # show current/ahead/behind/diverged
 cloudsync version
@@ -44,22 +44,21 @@ git branch --set-upstream-to=origin/my-feature
 
 ## Safety
 
-Cloudsync has no push path and never runs reset, rebase, stash, force checkout, or a merge commit.
+Cloudsync has no push path. The remote branch is the authority.
 
 It updates only when all of these are true:
 
 - the current worktree is on a branch;
 - that branch tracks a remote branch;
-- the local commit is an ancestor of the remote commit;
 - the worktree has no modified, staged, or untracked files.
 
-If the branch is dirty, ahead, or diverged, Cloudsync pauses and keeps the worktree untouched. After you resolve the local state, `watch` resumes automatically.
+If the remote was rebased, force-pushed, or moved backward, Cloudsync saves the replaced local commit at `refs/cloudsync/recovery/<branch>` and then makes the clean worktree match the remote. The recovery ref has a reflog, so successive rewrites remain recoverable.
 
-Remote force-pushes are fetched, but they are never forced onto the local branch. If history diverges, choose how to reconcile it yourself.
+If the worktree is dirty, Cloudsync pauses and changes nothing. After you clean it, `watch` resumes automatically.
 
 ## Why not `git pull` in a loop?
 
-`git pull` can merge or rebase depending on local config. Cloudsync accepts one update only: a clean fast-forward from the configured remote upstream. Every other state stops.
+`git pull` can merge or rebase depending on local config. Cloudsync has one rule: when the worktree is clean, make the current branch match its configured remote upstream. Otherwise, stop.
 
 ## Using with coding agents
 

@@ -69,7 +69,7 @@ rm "$LOCAL/local.txt"
 "$SYNC" sync >/dev/null
 check "sync resumes after cleanup" grep -q "^v3$" "$LOCAL/app.txt"
 
-echo "== local-only commit is never sent or overwritten =="
+echo "== remote remains authoritative over local-only commits =="
 echo "local commit" > "$LOCAL/local.txt"
 G "$LOCAL" add local.txt
 G "$LOCAL" commit -qm local-only
@@ -77,20 +77,46 @@ local_head=$(G "$LOCAL" rev-parse HEAD)
 remote_head=$(G "$REMOTE" rev-parse feature)
 "$SYNC" sync > "$S/ahead.log" 2>&1
 rc=$?
-check "ahead sync exits nonzero" test "$rc" -ne 0
-check "ahead sync explains pause" grep -q "local commits" "$S/ahead.log"
-check "ahead sync leaves local HEAD" bash -c "[ \"\$(git -C '$LOCAL' rev-parse HEAD)\" = '$local_head' ]"
+check "ahead sync exits 0" test "$rc" -eq 0
+check "ahead sync follows remote" bash -c "[ \"\$(git -C '$LOCAL' rev-parse HEAD)\" = '$remote_head' ]"
+check "ahead sync removes local-only file" bash -c "! test -e '$LOCAL/local.txt'"
+check "ahead sync keeps recovery ref" bash -c "[ \"\$(git -C '$LOCAL' rev-parse refs/cloudsync/recovery/feature)\" = '$local_head' ]"
 check "ahead sync never pushes" bash -c "[ \"\$(git -C '$REMOTE' rev-parse feature)\" = '$remote_head' ]"
 
-echo "== divergence is untouched =="
+echo "== rebased force-push is followed with recovery =="
 echo "v4" > "$CLOUD/app.txt"
 G "$CLOUD" commit -qam remote-v4
 G "$CLOUD" push -q
-"$SYNC" sync > "$S/diverged.log" 2>&1
+"$SYNC" sync >/dev/null
+pre_rebase_head=$(G "$LOCAL" rev-parse HEAD)
+G "$CLOUD" reset -q --hard HEAD~1
+echo "v4-rebased" > "$CLOUD/app.txt"
+G "$CLOUD" commit -qam remote-v4-rebased
+G "$CLOUD" push -q --force
+rebased_remote_head=$(G "$REMOTE" rev-parse feature)
+echo "dirty during rewrite" > "$LOCAL/dirty.txt"
+"$SYNC" sync > "$S/rewrite-dirty.log" 2>&1
 rc=$?
-check "diverged sync exits nonzero" test "$rc" -ne 0
-check "diverged sync explains pause" grep -q "histories diverged" "$S/diverged.log"
-check "diverged sync leaves local HEAD" bash -c "[ \"\$(git -C '$LOCAL' rev-parse HEAD)\" = '$local_head' ]"
+check "dirty rewrite exits nonzero" test "$rc" -ne 0
+check "dirty rewrite leaves local HEAD" bash -c "[ \"\$(git -C '$LOCAL' rev-parse HEAD)\" = '$pre_rebase_head' ]"
+check "dirty rewrite leaves file" grep -q "dirty during rewrite" "$LOCAL/dirty.txt"
+rm "$LOCAL/dirty.txt"
+"$SYNC" sync > "$S/rebased.log" 2>&1
+check "rebased sync follows force-push" bash -c "[ \"\$(git -C '$LOCAL' rev-parse HEAD)\" = '$rebased_remote_head' ]"
+check "rebased sync updates files" grep -q "^v4-rebased$" "$LOCAL/app.txt"
+check "rebased sync explains rewrite" grep -q "followed rewritten upstream" "$S/rebased.log"
+check "rebased sync keeps old HEAD" bash -c "[ \"\$(git -C '$LOCAL' rev-parse refs/cloudsync/recovery/feature)\" = '$pre_rebase_head' ]"
+
+echo "== backward force-push is followed with recovery =="
+pre_backward_head=$(G "$LOCAL" rev-parse HEAD)
+G "$CLOUD" reset -q --hard HEAD~1
+G "$CLOUD" push -q --force
+backward_remote_head=$(G "$REMOTE" rev-parse feature)
+"$SYNC" sync > "$S/backward.log" 2>&1
+check "backward sync follows remote" bash -c "[ \"\$(git -C '$LOCAL' rev-parse HEAD)\" = '$backward_remote_head' ]"
+check "backward sync restores older files" grep -q "^v3$" "$LOCAL/app.txt"
+check "backward sync keeps replaced HEAD" bash -c "[ \"\$(git -C '$LOCAL' rev-parse refs/cloudsync/recovery/feature)\" = '$pre_backward_head' ]"
+check "recovery reflog keeps prior rewrite" bash -c "git -C '$LOCAL' reflog show --format='%H' refs/cloudsync/recovery/feature | grep -q '$pre_rebase_head'"
 
 echo "== detached and missing-upstream states are refused =="
 DETACHED="$S/detached"
