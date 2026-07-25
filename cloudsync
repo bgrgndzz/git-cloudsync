@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.1.0"
+
+usage() {
+  cat <<'EOF'
+cloudsync — keep the current branch caught up with its remote
+
+  cloudsync sync                 fetch and fast-forward once
+  cloudsync watch [--interval N] fetch and fast-forward continuously
+  cloudsync status               compare the current branch with its upstream
+  cloudsync version              print version
+
+Cloudsync only moves remote → local. It never pushes, creates merge commits,
+resets, stashes, or overwrites local work. Dirty, ahead, and diverged branches
+are left untouched.
+EOF
+}
+
+die()  { echo "cloudsync: $*" >&2; exit 1; }
+note() { echo "cloudsync: $*"; }
+
+repo_top() {
+  git rev-parse --show-toplevel 2>/dev/null ||
+    die "current directory is not inside a git worktree"
+}
+
+load_branch() {
+  ROOT=$(repo_top)
+  BRANCH=$(git -C "$ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null) ||
+    die "detached HEAD — check out a branch first"
+  REMOTE=$(git -C "$ROOT" config --get "branch.$BRANCH.remote" 2>/dev/null || true)
+  MERGE_REF=$(git -C "$ROOT" config --get "branch.$BRANCH.merge" 2>/dev/null || true)
+  [ -n "$REMOTE" ] && [ -n "$MERGE_REF" ] ||
+    die "'$BRANCH' has no upstream — set one with: git branch --set-upstream-to=<remote>/<branch>"
+  [ "$REMOTE" != "." ] ||
+    die "'$BRANCH' tracks a local branch; cloudsync requires a remote upstream"
+  UPSTREAM_REF="refs/remotes/$REMOTE/${MERGE_REF#refs/heads/}"
+}
+
+fetch_upstream() {
+  git -C "$ROOT" fetch --quiet --no-tags "$REMOTE" "+$MERGE_REF:$UPSTREAM_REF"
+}
+
+relation() {
+  LOCAL_SHA=$(git -C "$ROOT" rev-parse HEAD)
+  REMOTE_SHA=$(git -C "$ROOT" rev-parse "$UPSTREAM_REF")
+
+  if [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
+    echo "current"
+  elif git -C "$ROOT" merge-base --is-ancestor "$LOCAL_SHA" "$REMOTE_SHA"; then
+    echo "behind"
+  elif git -C "$ROOT" merge-base --is-ancestor "$REMOTE_SHA" "$LOCAL_SHA"; then
+    echo "ahead"
+  else
+    echo "diverged"
+  fi
+}
+
+is_clean() {
+  [ -z "$(git -C "$ROOT" status --porcelain)" ]
+}
+
+sync_once() {
+  local state count old_short new_short
+
+  if ! fetch_upstream; then
+    note "could not fetch '$REMOTE'; retry later"
+    return 3
+  fi
+  state=$(relation)
+
+  case "$state" in
+    current)
+      return 0
+      ;;
+    ahead)
+      note "paused — '$BRANCH' has local commits not on '$REMOTE/${MERGE_REF#refs/heads/}'"
+      return 2
+      ;;
+    diverged)
+      note "paused — local and remote histories diverged; resolve them manually"
+      return 2
+      ;;
+    behind)
+      if ! is_clean; then
+        note "paused — local files are dirty; commit or discard them before syncing"
+        return 2
+      fi
+
+      count=$(git -C "$ROOT" rev-list --count HEAD.."$UPSTREAM_REF")
+      old_short=$(git -C "$ROOT" rev-parse --short HEAD)
+      if ! git -C "$ROOT" merge --ff-only --quiet "$UPSTREAM_REF"; then
+        note "update failed; local work was left untouched"
+        return 3
+      fi
+      new_short=$(git -C "$ROOT" rev-parse --short HEAD)
+      note "updated '$BRANCH' $old_short → $new_short ($count commit$( [ "$count" = 1 ] || printf 's' ))"
+      ;;
+  esac
+}
+
+cmd_sync() {
+  load_branch
+  sync_once
+}
+
+cmd_status() {
+  local state local_short remote_short remote_branch
+
+  load_branch
+  fetch_upstream
+  state=$(relation)
+  local_short=$(git -C "$ROOT" rev-parse --short HEAD)
+  remote_short=$(git -C "$ROOT" rev-parse --short "$UPSTREAM_REF")
+  remote_branch="$REMOTE/${MERGE_REF#refs/heads/}"
+
+  echo "worktree:  $ROOT"
+  echo "branch:    $BRANCH ($local_short)"
+  echo "upstream:  $remote_branch ($remote_short)"
+  echo "state:     $state"
+  if ! is_clean; then
+    echo "worktree:  dirty — sync will pause"
+  fi
+}
+
+cmd_watch() {
+  local interval=5 lock_dir last_message="" output rc
+
+  if [ "${1:-}" = "--interval" ]; then
+    [ -n "${2:-}" ] || die "--interval needs a number of seconds"
+    interval="$2"
+    shift 2
+  fi
+  [ "$#" -eq 0 ] || die "unknown watch argument: $1"
+  case "$interval" in
+    *[!0-9]*|"") die "--interval must be a positive whole number" ;;
+    0) die "--interval must be at least 1 second" ;;
+  esac
+
+  load_branch
+  lock_dir=$(git -C "$ROOT" rev-parse --path-format=absolute --git-path cloudsync-watch.lock)
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    die "another watcher is already running for this worktree ($lock_dir)"
+  fi
+
+  watch_cleanup() {
+    rmdir "$lock_dir" 2>/dev/null || true
+    echo
+    note "watch stopped"
+    exit 0
+  }
+  trap watch_cleanup INT TERM EXIT
+
+  note "watching '$BRANCH' from '$REMOTE/${MERGE_REF#refs/heads/}' every ${interval}s — Ctrl-C stops"
+  while :; do
+    output=""
+    rc=0
+    output=$(sync_once 2>&1) || rc=$?
+    if [ -n "$output" ] && [ "$output" != "$last_message" ]; then
+      echo "$output"
+    fi
+    last_message="$output"
+    sleep "$interval"
+  done
+}
+
+case "${1:-}" in
+  sync)    shift; [ "$#" -eq 0 ] || die "sync takes no arguments"; cmd_sync ;;
+  watch)   shift; cmd_watch "$@" ;;
+  status)  shift; [ "$#" -eq 0 ] || die "status takes no arguments"; cmd_status ;;
+  version) echo "cloudsync $VERSION" ;;
+  -h|--help|help|"") usage ;;
+  *) die "unknown command '$1' (try: cloudsync --help)" ;;
+esac
